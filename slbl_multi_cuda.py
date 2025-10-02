@@ -27,10 +27,10 @@ os.environ.setdefault("NUMEXPR_MAX_THREADS","1")
 # ---------------------------
 # User parameters
 # ---------------------------
-DEM_PATH       = r"D:\Python\SLBL\dtm.tif"
-SCENARIO_DIR   = r"D:\Python\SLBL\scenarios"
-OUT_DIR        = r"D:\Python\SLBL\outputs"
-CSV_SUMMARY    = r"D:\Python\SLBL\outputs\slbl_summary.csv"
+DEM_PATH       = r"D:\Python\path\SLBL\dtm.tif"
+SCENARIO_DIR   = r"D:\Python\path\SLBL\scenarios"
+OUT_DIR        = r"D:\Python\path\SLBL\outputs"
+CSV_SUMMARY    = r"D:\Python\path\SLBL\outputs\slbl_summary.csv"
 TARGET_EPSG    = 25833
 
 # --- pySLBL-compatible iteration parameters ---
@@ -62,7 +62,7 @@ MP_CHUNKSIZE   = 1
 # --- Outputs ---
 WRITE_RASTERS      = False
 WRITE_XSECTIONS    = True
-XSECT_LINES_SOURCE = r"D:\Python\SLBL\xsections"  # folder or single .shp
+XSECT_LINES_SOURCE = r"D:\Python\SLBL\path\xsections"  # folder or single .shp
 XSECT_STEP_M       = 5.0
 XSECT_DIRNAME      = "xsections"
 
