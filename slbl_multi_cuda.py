@@ -1,11 +1,13 @@
 #!/usr/bin/env python
-# SLBL batch processing with cuda capabilities
+# SLBL batch processing — CPU/GPU
+#
+# Notes (paper formulas) https://esurf.copernicus.org/articles/7/439/2019/:
+#   1) z_temp = mean(neighbours) - C, update if z_temp < z_prev (failure mode)
+#   2) Inverse SLBL: z_temp = mean(neighbours) + C, update if z_temp > z_prev
+#   3) C = (4 * e / Lrh) * (Δx^2)
+#   4) C = 4 * k * e * sqrt(A) * (Δx^2)   (inventory formulation)
 
-import os, sys, re, math, traceback
-from dataclasses import dataclass
-from itertools import product
-from multiprocessing import Pool, cpu_count
-
+import os, sys, re, traceback
 import numpy as np
 import pandas as pd
 import geopandas as gpd
@@ -13,332 +15,346 @@ import rasterio
 from rasterio import features
 from rasterio.transform import rowcol
 from shapely.geometry import box, LineString, MultiLineString
-from shapely import ops as sops
+from shapely.ops import unary_union
+from itertools import product
+from multiprocessing import Pool, cpu_count
+from pyproj import datadir as _proj_datadir
 
 # ---------------------------
-# Environment thread caps
+# Thread caps to avoid oversubscription (MP TUNING)
 # ---------------------------
-os.environ.setdefault("OMP_NUM_THREADS","1")
-os.environ.setdefault("MKL_NUM_THREADS","1")
-os.environ.setdefault("OPENBLAS_NUM_THREADS","1")
-os.environ.setdefault("VECLIB_MAXIMUM_THREADS","1")
-os.environ.setdefault("NUMEXPR_MAX_THREADS","1")
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_MAX_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("VECLIB_MAXIMUM_THREADS", "1")
 
 # ---------------------------
 # User parameters
 # ---------------------------
-DEM_PATH       = r"D:\Python\path\SLBL\dtm.tif"
-SCENARIO_DIR   = r"D:\Python\path\SLBL\scenarios"
-OUT_DIR        = r"D:\Python\path\SLBL\outputs"
-CSV_SUMMARY    = r"D:\Python\path\SLBL\outputs\slbl_summary.csv"
-TARGET_EPSG    = 25833
+DEM_PATH       = r"D:\Python\SLBL\yourpath\DEM.tif"
+SCENARIO_DIR   = r"D:\Python\SLBL\yourpath\scenarios"
+OUT_DIR        = r"D:\Python\SLBL\yourpath\outputs"
+CSV_SUMMARY    = r"D:\Python\SLBL\yourpath\outputs\slbl_summary.csv"
+TARGET_EPSG    = 25832
 
-# --- pySLBL-compatible iteration parameters ---
-NEIGHBOURS     = 8                   # 4 or 8
-CRITERIA       = "average"           # "average" or "minmax"
-MODE           = "failure"           # "failure" (lowering) or "inverse" (filling)
-STOP_EPS       = 1e-4                # stop when max|Δthickness| <= STOP_EPS
-MAX_VOLUME     = math.inf            # m^3; use math.inf for no limit
-NOT_DEEPEN     = True                # z_min clamp around polygon
-MAX_DEPTHS     = [None]              # meters; None for unlimited
+# --- SLBL mode & tolerance source ---
+SLBL_MODE      = "failure"    # "failure" (lowering) or "inverse" (filling)
 
-# --- Tolerance sources (C) and sweeps ---
-C_FROM         = ["manual"]          # "manual", "e_Lrh", "area_shape" (or a list of them)
-TOLERANCES     = [0.005, 0.01, 0.02, 0.03, 0.04]  # meters; used when "manual" in C_FROM
-E_RATIOS       = [0.0010]            # used with "e_Lrh"
-SHAPE_KS       = [1.0]               # used with "area_shape"
-E_RATIO        = 0.0010              # singleton fallback
-SHAPE_K        = 1.0                 # singleton fallback
+# C_FROM can be a string or a list of methods to sweep in one run.
+# Allowed values: "manual", "e_Lrh", "area_shape"
+# Examples:
+#   C_FROM = "manual"
+#   C_FROM = ["manual","e_Lrh","area_shape"]
+C_FROM         = ["manual", "e_Lrh","area_shape"]
 
-# --- Mask rasterization & buffer ---
+# --- Parameter sweeps ---
+# For "e_Lrh" → sweep E (zmax/Lrh)
+E_RATIOS       = [0.0001, 0.0002, 0.0003]
+# For "area_shape" → sweep E and K together (Cartesian product)
+SHAPE_KS       = [0.1, 0.2, 0.4]
+
+# Back-compat (singletons still supported if you prefer):
+E_RATIO        = 0.10     # used only if E_RATIOS is not a list
+SHAPE_K        = 1.0      # used only if SHAPE_KS is not a list
+
+# For "manual" → sweep tolerances (meters)
+TOLERANCES     = [0.001, 0.002, 0.005, 0.01]
+
+# Hard stops / neighbour rule
+MAX_DEPTHS     = [None]
+NEIGHBOURS     = 8
+STOP_EPS       = 1e-3
+STOP_VOL_EPS   = None               # e.g. 1.0 (m^3)
+MAX_ITERS      = 5000
+
+# Optional constraints
+FIXED_PATH     = None
 ALL_TOUCHED    = True
-BUFFER_PIXELS  = 2                   # outward buffer around polygons (pySLBL pads extent by 2 px)
+BUFFER_PIXELS  = 4
 
-# --- GPU and MP ---
-USE_GPU        = True                # auto-disables if no CUDA
-N_PROCESSES    = max(1, cpu_count()-1)
-MP_CHUNKSIZE   = 1
+# Multiprocessing policy
+N_PROCESSES    = 1
+MP_CHUNKSIZE   = 2
 
-# --- Outputs ---
-WRITE_RASTERS      = False
-WRITE_XSECTIONS    = True
-XSECT_LINES_SOURCE = r"D:\Python\SLBL\path\xsections"  # folder or single .shp
-XSECT_STEP_M       = 5.0
-XSECT_DIRNAME      = "xsections"
+WRITE_RASTERS   = True
+WRITE_XSECTIONS = True
+XSECT_LINES_SOURCE = [ r"D:\Python\SLBL\yourpath\xsections" ]
+XSECT_STEP_M      = None
+XSECT_CLIP_TO_POLY= False
+XSECT_DIRNAME     = "xsections"
+
+USE_Z_FLOOR    = False
+USE_MINMAX     = False        # keep False
+
+FEATHER_TOL_K  = [0, 50, 100]  # 0 disables feathering
+
+# Gradation controls
+GRADATION_ENABLE       = False
+GRADATION_SPLIT_METHOD = "elev"       # "elev" or "y"
+GRADATION_ELEV_Q       = 0.50
+GRADATION_K_PAIRS      = None         # e.g. [(50,100),(50,150),(100,150)]
+
+# GPU
+USE_GPU = True
+
+DEBUG_WRITE_TOL_RASTER = False
+DEBUG_REPORT_CLAMP     = True
+
+CSV_SCENARIO_STATS = os.path.join(os.path.dirname(CSV_SUMMARY), "slbl_scenario_stats.csv")
+
+print("[ENV] Python:", sys.executable)
+print("[ENV] pyproj data dir:", _proj_datadir.get_data_dir())
 
 # ---------------------------
-# GPU backend (CuPy)
+# Optional GPU backend (CuPy) — CUPY FIX
 # ---------------------------
 HAVE_CUPY = False
 cp = None
 try:
     if USE_GPU:
         import cupy as cp
-        HAVE_CUPY = cp.cuda.runtime.getDeviceCount() > 0
+        import cupyx.scipy.ndimage as cpx_nd
+        HAVE_CUPY = (cp.cuda.runtime.getDeviceCount() > 0)
         if HAVE_CUPY:
             props = cp.cuda.runtime.getDeviceProperties(0)
             name = props["name"]
             if isinstance(name, bytes): name = name.decode(errors="ignore")
-            print(f"[GPU] Using: {name}")
+            print(f"[GPU] Detected device: {name}")
         else:
-            print("[GPU] No CUDA device detected; falling back to CPU.")
+            print("[GPU] No CUDA device detected")
 except Exception as e:
-    print(f"[GPU] CuPy unavailable: {e}")
+    print(f"[GPU] CuPy not usable ({type(e).__name__}: {e})")
     HAVE_CUPY = False
 
-# Enforce single-process mode if GPU is used
-if HAVE_CUPY:
-    print("[GPU] Enabling single-process mode to give the GPU full control.")
-    globals()["N_PROCESSES"] = 1
-
 # ---------------------------
-# Helpers: IO / CRS / mask
+# IO / CRS helpers
 # ---------------------------
-def read_dem(path):
-    src = rasterio.open(path)
-    if src.crs is None: raise RuntimeError("DEM has no CRS.")
-    if src.crs.to_epsg() != TARGET_EPSG:
-        raise RuntimeError(f"DEM EPSG {src.crs.to_epsg()} != TARGET_EPSG {TARGET_EPSG}")
-    arr = src.read(1, masked=True).astype("float64")
-    pixel = abs(src.transform.a)
-    pix_area = abs(src.transform.a) * abs(src.transform.e)
-    return src, arr, src.profile.copy(), pixel, pix_area, box(*src.bounds)
+def read_dem(dem_path):
+    src = rasterio.open(dem_path)
+    if src.crs is None:
+        raise RuntimeError("DEM has no CRS.")
+    dem_epsg = src.crs.to_epsg()
+    if dem_epsg != TARGET_EPSG:
+        raise RuntimeError(f"DEM EPSG is {dem_epsg}, expected {TARGET_EPSG}.")
+    dem = src.read(1, masked=True).astype("float64")
+    prof = src.profile.copy()
+    pixel_area = abs(src.transform.a) * abs(src.transform.e)
+    dem_bounds = box(*src.bounds)
+    print(f"[INFO] DEM pixel={abs(src.transform.a)} m, shape={dem.shape}")
+    return src, dem, prof, pixel_area, dem_bounds, dem_epsg
 
-def load_gdf(path, epsg, pixel_size=None, buffer_pixels=0):
-    gdf = gpd.read_file(path)
-    if gdf.empty: raise ValueError("Empty shapefile.")
-    if gdf.crs is None: raise ValueError("Shapefile has no CRS.")
-    if gdf.crs.to_epsg() != epsg: gdf = gdf.to_crs(epsg=epsg)
-    # dissolve multipolygons for mask (like pySLBL "processing extent")
-    if gdf.geom_type.isin(["Polygon","MultiPolygon"]).any():
-        gdf["__diss__"]=1
+def load_and_prepare_gdf(vec_path, target_epsg, pixel_size=None, buffer_pixels=0):
+    gdf = gpd.read_file(vec_path)
+    if gdf.empty: raise ValueError("Empty shapefile")
+    if gdf.crs is None: raise ValueError("Shapefile CRS is undefined")
+    if gdf.crs.to_epsg() != target_epsg:
+        gdf = gdf.to_crs(epsg=target_epsg)
+    if "geometry" in gdf and gdf.geom_type.isin(["Polygon","MultiPolygon"]).any():
+        gdf["__diss__"] = 1
         gdf = gdf.dissolve(by="__diss__", as_index=False).drop(columns="__diss__", errors="ignore")
     if buffer_pixels and pixel_size and gdf.geom_type.isin(["Polygon","MultiPolygon"]).any():
-        gdf["geometry"] = gdf.buffer(buffer_pixels*pixel_size)
+        gdf["geometry"] = gdf.buffer(buffer_pixels * pixel_size)
     gdf = gdf[gdf.geometry.notna() & (~gdf.geometry.is_empty)]
+    if gdf.empty: raise ValueError("Geometry empty after cleaning/buffering.")
     return gdf
 
-def rasterize_mask(gdf, like_src, all_touched=True):
-    shapes = ((geom, 1) for geom in gdf.geometry if geom and not geom.is_empty)
+def load_lines_gdf(vec_path, target_epsg):
+    if not vec_path: return None
+    gdf = gpd.read_file(vec_path)
+    if gdf.empty: raise ValueError("Cross-section file is empty.")
+    if gdf.crs is None: raise ValueError("Cross-section file CRS is undefined.")
+    if gdf.crs.to_epsg() != target_epsg:
+        gdf = gdf.to_crs(epsg=target_epsg)
+    gdf = gdf[gdf.geom_type.isin(["LineString","MultiLineString"])]
+    if gdf.empty: raise ValueError("No LineString/MultiLineString geometries.")
+    return gdf
+
+def _collect_line_paths(source):
+    if not source: return []
+    items = list(source) if isinstance(source,(list,tuple)) else [source]
+    out = []
+    for item in items:
+        if os.path.isdir(item):
+            out += [os.path.join(item,f) for f in os.listdir(item) if f.lower().endswith(".shp")]
+        elif str(item).lower().endswith(".shp"):
+            out.append(item)
+    return sorted(set(out))
+
+def load_lines_many(source, target_epsg):
+    paths = _collect_line_paths(source)
+    if not paths: return None, 0
+    frames = []
+    for p in paths:
+        try:
+            gdf = load_lines_gdf(p, target_epsg)
+            if not gdf.empty: frames.append(gdf)
+        except Exception as e:
+            print(f"[WARN] load {p}: {e}")
+    if not frames: return None, 0
+    merged = pd.concat(frames, ignore_index=True)
+    return merged, len(paths)
+
+# ---------------------------
+# Rasterization / neighbours
+# ---------------------------
+def vector_to_mask(gdf, like_src, all_touched=True, burn_value=1):
+    shapes = ((geom, burn_value) for geom in gdf.geometry if geom and not geom.is_empty)
     mask = features.rasterize(
         shapes=shapes,
         out_shape=(like_src.height, like_src.width),
         transform=like_src.transform,
-        fill=0, dtype="uint8", all_touched=all_touched
+        fill=0, all_touched=all_touched, dtype="uint8"
     ).astype(bool)
     return mask
 
-def fill_nodata_nearest(dem_ma):
-    """Fill DEM NoData with nearest (pySLBL behaviour)."""
-    arr = dem_ma.filled(np.nan)
-    if np.isfinite(arr).all(): return np.ma.array(arr, mask=False)
-    try:
-        from scipy.interpolate import griddata
-        H, W = arr.shape
-        yy, xx = np.mgrid[0:H, 0:W]
-        pts = np.column_stack((xx[np.isfinite(arr)], yy[np.isfinite(arr)]))
-        vals= arr[np.isfinite(arr)]
-        filled = griddata(pts, vals, (xx,yy), method="nearest")
-        return np.ma.array(filled, mask=np.isnan(filled))
-    except Exception:
-        a = arr.copy()
-        for _ in range(8):  # crude grow
-            n = a.copy()
-            for dy,dx in [(-1,0),(1,0),(0,-1),(0,1),(-1,-1),(-1,1),(1,-1),(1,1)]:
-                n = np.where(np.isfinite(n), n,
-                             np.roll(np.where(np.isfinite(a),a,np.nan), (dy,dx), (0,1)))
-            a = np.where(np.isfinite(a), a, n)
-            if np.isfinite(a).all(): break
-        return np.ma.array(a, mask=~np.isfinite(a))
+# FAST CPU mean
+try:
+    from scipy.ndimage import convolve as _sp_convolve
+    _HAVE_SCIPY = True
+except Exception:
+    _HAVE_SCIPY = False
 
-def compute_z_min_border(mask, dem_ma):
-    """z_min from 1-pixel border ring (pySLBL 'Expand 1')."""
-    try:
-        from scipy.ndimage import binary_dilation
-        ring = binary_dilation(mask, iterations=1) & (~mask)
-    except Exception:
-        H,W = mask.shape
-        ring = np.zeros_like(mask, dtype=bool)
-        for dy,dx in [(-1,0),(1,0),(0,-1),(0,1)]:
-            y0s, y1s = max(0,dy), H+min(0,dy)
-            x0s, x1s = max(0,dx), W+min(0,dx)
-            y0d, y1d = max(0,-dy), H+min(0,-dy)
-            x0d, x1d = max(0,-dx), W+min(0,-dx)
-            if y0s<y1s and x0s<x1s:
-                ring[y0d:y1d, x0d:x1d] |= mask[y0s:y1s, x0s:x1s]
-        ring &= ~mask
-    arr = dem_ma.filled(np.nan)
-    if not np.any(ring): return np.nan
-    return float(np.nanmin(arr[ring]))
-
-# ---------------------------
-# Neighbour stats — CPU & GPU
-# ---------------------------
-NEIGH_SHIFTS4 = [(-1,0),(1,0),(0,-1),(0,1)]
-NEIGH_SHIFTS8 = NEIGH_SHIFTS4 + [(-1,-1),(-1,1),(1,-1),(1,1)]
-
-def _stack_neighbours_cpu(arr, valid, mode8=False):
-    H,W = arr.shape
-    shifts = NEIGH_SHIFTS8 if mode8 else NEIGH_SHIFTS4
-    st = np.full((H,W,len(shifts)), np.nan, dtype="float64")
-    for k,(dy,dx) in enumerate(shifts):
-        y0s, y1s = max(0,dy), H+min(0,dy)
-        x0s, x1s = max(0,dx), W+min(0,dx)
-        y0d, y1d = max(0,-dy), H+min(0,-dy)
-        x0d, x1d = max(0,-dx), W+min(0,-dx)
+def _neigh_mean_cpu(arr, valid, mode8=False):
+    if _HAVE_SCIPY:
+        kernel = np.array([[1,1,1],[1,0,1],[1,1,1]], dtype=np.float32) if mode8 else \
+                 np.array([[0,1,0],[1,0,1],[0,1,0]], dtype=np.float32)
+        a = np.where(valid & np.isfinite(arr), arr, 0.0).astype(np.float32)
+        m = (valid & np.isfinite(arr)).astype(np.float32)
+        s = _sp_convolve(a, kernel, mode="constant", cval=0.0)
+        c = _sp_convolve(m, kernel, mode="constant", cval=0.0)
+        out = np.divide(s, c, out=np.full_like(s, np.nan, dtype=np.float32), where=(c>0))
+        return out.astype(np.float64)
+    # fallback
+    H, W = arr.shape
+    s = np.zeros((H,W), dtype="float64")
+    c = np.zeros((H,W), dtype="float64")
+    shifts4 = [(-1,0),(1,0),(0,-1),(0,1)]
+    shifts8 = shifts4 + [(-1,-1),(-1,1),(1,-1),(1,1)]
+    shifts = shifts8 if mode8 else shifts4
+    for dy, dx in shifts:
+        y0s, y1s = max(0, dy), H + min(0, dy)
+        x0s, x1s = max(0, dx), W + min(0, dx)
+        y0d, y1d = max(0,-dy), H + min(0,-dy)
+        x0d, x1d = max(0,-dx), W + min(0,-dx)
         if y0s>=y1s or x0s>=x1s: continue
-        nb = arr[y0s:y1s, x0s:x1s]
-        vm = valid[y0s:y1s, x0s:x1s]
-        blk = np.where(vm, nb, np.nan)
-        st[y0d:y1d, x0d:x1d, k] = blk
-    return st
+        neigh = arr[y0s:y1s, x0s:x1s]
+        vmask = valid[y0s:y1s, x0s:x1s] & np.isfinite(neigh)
+        s[y0d:y1d, x0d:x1d] += np.where(vmask, neigh, 0.0)
+        c[y0d:y1d, x0d:x1d] += vmask.astype("float64")
+    out = np.divide(s, c, out=np.full_like(s, np.nan), where=(c>0))
+    return out
 
-def _stack_neighbours_gpu(arr_g, valid_g, mode8=False):
-    shifts = NEIGH_SHIFTS8 if mode8 else NEIGH_SHIFTS4
-    H,W = arr_g.shape
-    st = cp.full((H,W,len(shifts)), cp.nan, dtype=cp.float64)
-    for k,(dy,dx) in enumerate(shifts):
-        nb = cp.full_like(arr_g, cp.nan)
-        vm = cp.full_like(valid_g, False)
-        y0s, y1s = max(0,dy), H+min(0,dy)
-        x0s, x1s = max(0,dx), W+min(0,dx)
-        y0d, y1d = max(0,-dy), H+min(0,-dy)
-        x0d, x1d = max(0,-dx), W+min(0,-dx)
-        if y0s>=y1s or x0s>=x1s: continue
-        nb[y0d:y1d, x0d:x1d] = arr_g[y0s:y1s, x0s:x1s]
-        vm[y0d:y1d, x0d:x1d] = valid_g[y0s:y1s, x0s:x1s]
-        st[:,:,k] = cp.where(vm, nb, cp.nan)
-    return st
+def _neigh_mean_gpu(arr_g, valid_g, mode8=False):
+    kernel = np.array([[1,1,1],[1,0,1],[1,1,1]], dtype=np.float32) if mode8 else \
+             np.array([[0,1,0],[1,0,1],[0,1,0]], dtype=np.float32)
+    k = cp.asarray(kernel)
+    arrv = cp.where(valid_g & cp.isfinite(arr_g), arr_g, 0.0)
+    cntm = valid_g.astype(cp.float32)
+    s = cpx_nd.convolve(arrv, k, mode="constant", cval=0.0)
+    c = cpx_nd.convolve(cntm, k, mode="constant", cval=0.0)
+    out = cp.where(c>0, s/c, cp.nan)
+    return out
 
-def neighbour_stat(arr, valid, criteria="average", mode8=False, use_gpu=False):
+def neighbour_mean(arr, valid, mode8=False, use_gpu=False):
     if use_gpu and HAVE_CUPY:
         arr_g   = arr if isinstance(arr, cp.ndarray) else cp.asarray(arr)
         valid_g = valid if isinstance(valid, cp.ndarray) else cp.asarray(valid)
-        st = _stack_neighbours_gpu(arr_g, valid_g, mode8)
-        if criteria == "minmax":
-            mx = cp.nanmax(st, axis=2)
-            mn = cp.nanmin(st, axis=2)
-            return (mx + mn) / 2.0
-        s = cp.nansum(st, axis=2)
-        c = cp.sum(cp.isfinite(st), axis=2)
-        return cp.where(c>0, s/c, cp.nan)
-    # CPU
-    st = _stack_neighbours_cpu(arr, valid, mode8)
-    if criteria == "minmax":
-        mx = np.nanmax(st, axis=2)
-        mn = np.nanmin(st, axis=2)
-        return (mx + mn) / 2.0
-    s = np.nansum(st, axis=2)
-    c = np.sum(np.isfinite(st), axis=2)
-    out = np.full_like(s, np.nan, dtype="float64")
-    np.divide(s, c, out=out, where=(c>0))
-    return out
+        return _neigh_mean_gpu(arr_g, valid_g, mode8)
+    return _neigh_mean_cpu(arr, valid, mode8)
 
 # ---------------------------
-# Geometry helpers for auto C
+# SLBL utils (z-floor, gradation)
 # ---------------------------
-def _poly_dims(g):
-    mbr = g.minimum_rotated_rectangle
-    if mbr.is_empty: return np.nan, np.nan
-    coords = np.asarray(mbr.exterior.coords)
-    if coords.shape[0] < 5: return np.nan, np.nan
-    edges = np.sqrt(np.sum(np.diff(coords[:4], axis=0)**2, axis=1))
-    Lrh, w = np.sort(edges)[::-1][:2]
-    return float(Lrh), float(w)
+def compute_z_floor(inmask, dem, use_gpu=False):
+    try:
+        if use_gpu and HAVE_CUPY:
+            ring = cpx_nd.binary_dilation(cp.asarray(inmask), iterations=1) & (~cp.asarray(inmask))
+            arr = cp.asarray(dem.filled(np.nan))
+            if cp.any(ring):
+                return float(cp.nanmin(arr[ring]).get())
+            return np.nan
+        else:
+            from scipy.ndimage import binary_dilation
+            ring = binary_dilation(inmask, iterations=1) & (~inmask)
+            arr = dem.filled(np.nan)
+            if np.any(ring):
+                return float(np.nanmin(arr[ring]))
+            return np.nan
+    except Exception as e:
+        print("[WARN] compute_z_floor:", e)
+        return np.nan
 
-def _auto_C_from_e_Lrh(e, Lrh, dx):
-    if not np.isfinite(e) or not np.isfinite(Lrh) or Lrh <= 0: return np.nan
-    return float((4.0 * e / Lrh) * (dx*dx))
+def build_upper_lower_masks(dem, inmask, method="elev", elev_q=0.5):
+    arr = dem.filled(np.nan)
+    if method == "elev":
+        vals = arr[inmask]
+        if vals.size and np.isfinite(vals).any():
+            z_split = float(np.nanquantile(vals, float(elev_q)))
+            upper = inmask & (arr >= z_split)
+            lower = inmask & (arr <  z_split)
+            return upper, lower, {"mode":"elev","z_split":z_split}
+    H, W = inmask.shape
+    r = np.arange(H).reshape(H,1)
+    split = int(H*float(elev_q))
+    upper = inmask & (r < split)
+    lower = inmask & (r >= split)
+    return upper, lower, {"mode":"y","row_split":split}
 
-def _auto_C_from_area_shape(e, A, k, dx):
-    if not np.isfinite(e) or not np.isfinite(A) or A<=0: return np.nan
-    return float((4.0 * k * e * math.sqrt(A)) * (dx*dx))
+def _edt_cpu(mask):
+    from scipy.ndimage import distance_transform_edt
+    return distance_transform_edt(mask.astype(np.uint8))
 
-# ---------------------------
-# Exact pySLBL-like iterative solver (CPU/GPU)
-# ---------------------------
-def slbl_iterative_exact(
-    dem_ma, inmask, tol_scalar, *,
-    criteria="average", neighbours=4, mode="failure",
-    stop_eps=1e-4, max_volume=math.inf, pixel_area=1.0,
-    max_depth=None, not_deepen=True, use_gpu=False
-):
-    """GPU/CPU implementation with identical pySLBL semantics."""
-    dem_np = fill_nodata_nearest(dem_ma).filled(np.nan).astype("float64")
-    valid_np = np.isfinite(dem_np)
-    work_mask_np = inmask & valid_np
-    if not np.any(work_mask_np):
-        return dem_np.copy(), np.zeros_like(dem_np), 0
+def _edt_gpu(mask_g):
+    return cpx_nd.distance_transform_edt(mask_g)
 
-    z_floor = compute_z_min_border(inmask, np.ma.array(dem_np, mask=~valid_np)) if not_deepen else np.nan
-    floor_md_np = (dem_np - float(max_depth)) if (max_depth is not None) else None
+def compute_feathered_tol(inmask, tol_scalar, K, use_gpu=False):
+    H, W = inmask.shape
+    tol_arr = np.full((H,W), float(tol_scalar), dtype="float64")
+    if not K or K<=0: return tol_arr
+    try:
+        if use_gpu and HAVE_CUPY:
+            dist = _edt_gpu(cp.asarray(inmask))
+            w = cp.clip(dist/float(K), 0.0, 1.0)
+            t = float(tol_scalar)*w
+            t[~cp.asarray(inmask)] = float(tol_scalar)
+            return cp.asnumpy(t)
+        else:
+            dist = _edt_cpu(inmask)
+            w = np.clip(dist/float(K), 0.0, 1.0)
+            tol_arr = tol_scalar * w
+            tol_arr[~inmask] = tol_scalar
+            return tol_arr
+    except Exception as e:
+        print("[WARN] feather:", e); return tol_arr
 
-    mode8    = (neighbours == 8)
-    failure  = (str(mode).lower() == "failure")
-    tol      = float(abs(tol_scalar))
-    max_volf = float(max_volume)
+def compute_feathered_tol_gradated(inmask, tol_scalar, K_upper, K_lower, upper_mask, lower_mask, use_gpu=False):
+    H, W = inmask.shape
+    tol_arr = np.full((H,W), float(tol_scalar), dtype="float64")
+    try:
+        if use_gpu and HAVE_CUPY:
+            du = _edt_gpu(cp.asarray(upper_mask))
+            dl = _edt_gpu(cp.asarray(lower_mask))
+            w = cp.zeros((H,W), dtype=cp.float32)
+            if K_upper and K_upper>0: w[cp.asarray(upper_mask)] = du[cp.asarray(upper_mask)]/float(K_upper)
+            if K_lower and K_lower>0: w[cp.asarray(lower_mask)] = dl[cp.asarray(lower_mask)]/float(K_lower)
+            w = cp.clip(w, 0.0, 1.0)
+            t = float(tol_scalar)*w
+            t[~cp.asarray(inmask)] = float(tol_scalar)
+            return cp.asnumpy(t)
+        else:
+            du = _edt_cpu(upper_mask)
+            dl = _edt_cpu(lower_mask)
+            w = np.zeros((H,W), dtype="float64")
+            if K_upper and K_upper>0: w[upper_mask] = du[upper_mask]/float(K_upper)
+            if K_lower and K_lower>0: w[lower_mask] = dl[lower_mask]/float(K_lower)
+            w = np.clip(w, 0.0, 1.0)
+            tol_arr = tol_scalar * w
+            tol_arr[~inmask] = tol_scalar
+            return tol_arr
+    except Exception as e:
+        print("[WARN] feather-grad:", e); return tol_arr
 
-    on_gpu = bool(use_gpu and HAVE_CUPY)
-    xp = cp if on_gpu else np
-
-    if on_gpu:
-        print("[GPU] SLBL iteration running on CUDA.")
-        dem     = cp.asarray(dem_np)
-        valid   = cp.asarray(valid_np)
-        work_m  = cp.asarray(work_mask_np)
-        in_m    = cp.asarray(inmask)
-        floor_md = cp.asarray(floor_md_np) if floor_md_np is not None else None
-    else:
-        dem     = dem_np
-        valid   = valid_np
-        work_m  = work_mask_np
-        in_m    = inmask
-        floor_md = floor_md_np
-
-    base       = dem.copy()
-    thick_prev = xp.zeros_like(base)
-    nb_iter    = 0
-    z_floor_backend = float(z_floor)
-
-    while True:
-        nb_iter += 1
-        nb = neighbour_stat(base, valid, criteria=criteria, mode8=mode8, use_gpu=on_gpu)
-        target = (nb - tol) if failure else (nb + tol)
-        cand = xp.where(work_m & xp.isfinite(target), target, base)
-        if floor_md is not None:
-            cand = xp.maximum(cand, floor_md)
-        if math.isfinite(z_floor_backend):
-            cand = xp.maximum(cand, z_floor_backend)
-        new_base = xp.minimum(cand, base) if failure else xp.maximum(cand, base)
-        new_base = xp.where(in_m, new_base, dem)
-
-        thick  = xp.abs(dem - new_base) if failure else xp.abs(new_base - dem)
-        grid_d = xp.abs(thick - thick_prev)
-        delta  = float((xp.nanmax(grid_d)).get() if on_gpu else xp.nanmax(grid_d))
-        volume = float(((xp.nansum(thick))*pixel_area).get() if on_gpu else (xp.nansum(thick))*pixel_area)
-
-        base[:]       = new_base
-        thick_prev[:] = thick
-
-        if nb_iter % 100 == 0 or nb_iter <= 5:
-            max_t = float((xp.nanmax(thick)).get() if on_gpu else xp.nanmax(thick))
-            print(f"[ITR] iter={nb_iter} delta={delta:.6e} max_thick={max_t:.3f} vol={volume:.3f} m^3")
-
-        if not (delta > stop_eps and volume < max_volf):
-            break
-        if nb_iter >= 5000:
-            print("[WARN] Reached 5000 iterations; stopping.")
-            break
-
-    if on_gpu:
-        base  = cp.asnumpy(base)
-        thick = cp.asnumpy(thick)
-
-    return base, (dem_np - base if failure else base - dem_np), nb_iter
-
-# ---------------------------
-# Outputs & labels
-# ---------------------------
 def save_gtiff(path, arr, profile, nodata=np.nan):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     prof = profile.copy()
@@ -353,10 +369,9 @@ def save_gtiff(path, arr, profile, nodata=np.nan):
         with rasterio.open(path,"w",**prof2) as dst:
             dst.write(arr.astype("float32"),1)
 
-# ---- v3-compatible label + xsection helpers ----
 def format_tol_label(tol_m):
-    t = abs(float(tol_m)) if np.isscalar(tol_m) else float(np.nanmax(tol_m))
-    return f"tol{int(round(t*100)):02d}cm" if t < 1.0 else f"tol{t:.2f}m"
+    t = float(abs(tol_m)) if np.isscalar(tol_m) else float(np.nanmax(tol_m))
+    return f"tol{t:.4f}m"
 
 def format_md_label(max_depth):
     return f"md{int(max_depth)}m" if max_depth is not None else "nolimit"
@@ -366,7 +381,6 @@ def format_fk_label(K):
         return f"fk{int(K[0])}to{int(K[1])}pxg"
     return f"fk{int(K)}px" if (K is not None and K>0) else "fk0"
 
-# --- x-section helpers (safe) ---
 def _sanitize(s):
     if s is None: return "line"
     s = re.sub(r"\s+","_",str(s).strip())
@@ -374,44 +388,29 @@ def _sanitize(s):
     return s or "line"
 
 def _line_parts(geom):
-    from shapely.geometry import LineString, MultiLineString, GeometryCollection
-    if geom is None or geom.is_empty:
-        return []
-    if isinstance(geom, LineString):
-        return [geom]
-    if isinstance(geom, MultiLineString):
-        return [g for g in geom.geoms if isinstance(g, LineString) and not g.is_empty]
-    if isinstance(geom, GeometryCollection):
-        parts = []
+    if isinstance(geom, LineString): yield geom
+    elif isinstance(geom, MultiLineString):
         for g in geom.geoms:
-            parts.extend(_line_parts(g))
-        return parts
-    try:
-        return [g for g in geom.geoms if hasattr(g, "coords")]
-    except Exception:
-        return []
+            if isinstance(g, LineString): yield g
 
-def _densify_line(line, step_m):
-    L = float(line.length)
-    if L <= 0:
-        p0, p1 = line.coords[0], line.coords[-1]
-        return [(p0[0], p0[1], 0.0), (p1[0], p1[1], L)]
-    step = max(float(step_m) if step_m else 0.0, 0.001)
-    n = max(1, int(L // step))
-    dists = [i*step for i in range(n+1)]
+def _densify_line(line: LineString, step_m: float):
+    L = line.length
+    if L<=0 or (step_m or 0)<=0:
+        return [(line.coords[0][0], line.coords[0][1], 0.0),
+                (line.coords[-1][0],line.coords[-1][1], L)]
+    n = max(1, int(np.floor(L/step_m)))
+    dists = [i*step_m for i in range(n+1)]
     if dists[-1] < L: dists.append(L)
     pts = []
     for d in dists:
-        p = line.interpolate(d)
-        pts.append((float(p.x), float(p.y), float(d)))
+        p = line.interpolate(d); pts.append((p.x,p.y,d))
     return pts
 
 def _sample_arrays(xy_dist_pts, transform, dem_arr, base_arr, thick_arr, inmask=None):
     xs = [x for x,_,_ in xy_dist_pts]; ys = [y for _,y,_ in xy_dist_pts]
     rows, cols = rowcol(transform, xs, ys, op=float)
     rows = np.rint(rows).astype(int); cols = np.rint(cols).astype(int)
-    H, W = dem_arr.shape
-    out=[]
+    H, W = dem_arr.shape; out=[]
     for (x,y,d), r, c in zip(xy_dist_pts, rows, cols):
         if r<0 or c<0 or r>=H or c>=W: continue
         if inmask is not None and not inmask[r,c]: continue
@@ -421,230 +420,549 @@ def _sample_arrays(xy_dist_pts, transform, dem_arr, base_arr, thick_arr, inmask=
         out.append((d,x,y,dz,bz,th))
     return out
 
-def _infer_line_id(row_or_geom, idx=0):
+def _infer_line_id(row):
+    for k in ["name","Name","NAME","id","ID","Id","label","Label"]:
+        if k in row.index and pd.notna(row[k]): return _sanitize(row[k])
+    return f"line{int(row.name)}"
+
+# ---------------------------
+# Geometry helpers for C estimation
+# ---------------------------
+def _poly_dims(g):
+    """Return (Lrh, w) from oriented minimum bounding rectangle (meters)."""
     try:
-        row = row_or_geom
-        for k in ("name","Name","NAME","id","ID","Id","label","Label"):
-            if (hasattr(row,"__contains__") and k in row) and pd.notna(row[k]):
-                return _sanitize(row[k])
+        mbr = g.minimum_rotated_rectangle
+        if mbr.is_empty: return np.nan, np.nan
+        coords = np.asarray(mbr.exterior.coords)
+        if coords.shape[0] < 5: return np.nan, np.nan
+        edges = np.sqrt(np.sum(np.diff(coords[:4], axis=0)**2, axis=1))
+        l1, l2 = np.sort(edges)[::-1][:2]
+        Lrh = float(l1)
+        w   = float(l2)
+        return Lrh, w
     except Exception:
-        pass
-    return f"line{int(idx)}"
+        return np.nan, np.nan
+
+def _auto_C_from_e_Lrh(e, Lrh, dx):
+    # C = (4 * e / Lrh) * dx^2
+    if not np.isfinite(e) or not np.isfinite(Lrh) or Lrh <= 0 or dx <= 0: return np.nan
+    return float((4.0 * e / float(Lrh)) * (dx*dx))
+
+def _auto_C_from_area_shape(e, A, k, dx):
+    # C = 4 * k * e * sqrt(A) * dx^2
+    if not np.isfinite(e) or not np.isfinite(A) or A <= 0 or dx <= 0: return np.nan
+    return float((4.0 * k * e * np.sqrt(A)) * (dx*dx))
 
 # ---------------------------
-# Single job runner
+# Iterative solver (CPU/GPU) — exact SLBL logic
 # ---------------------------
-@dataclass
-class Job:
-    shp_path: str
-    method: str
-    tol_in: float
-    e_ratio: float
-    shape_k: float
-    max_depth: float|None
+def slbl_iterative(dem, inmask, tol_m=0.1, stop_eps=1e-4, max_iters=2000,
+                   neighbours=4, max_depth=None, fixed_mask=None, z_floor=None,
+                   use_gpu=False, mode="failure", stop_vol_eps=None, pixel_area=1.0):
+    """
+    mode='failure'  → lower:  target = mean - C, update if target < base
+    mode='inverse'  → fill:   target = mean + C, update if target > base
+    """
+    H, W = dem.shape
+    dem_np = dem.filled(np.nan)
+    valid_np = np.isfinite(dem_np)
+    work_mask = inmask & valid_np
+    if not np.any(work_mask):
+        base0 = dem_np.copy()
+        thick0 = np.zeros_like(base0)
+        return base0, thick0
 
-def run_one(job: Job):
-    name = os.path.splitext(os.path.basename(job.shp_path))[0]
-    try:
-        src, dem_ma, prof, dx, pix_area, dem_bounds = read_dem(DEM_PATH)
-        dem_epsg = src.crs.to_epsg()
-        gdf = load_gdf(job.shp_path, dem_epsg, pixel_size=dx, buffer_pixels=BUFFER_PIXELS)
-        if not gdf.intersects(gpd.GeoSeries([dem_bounds], crs=f"EPSG:{dem_epsg}").iloc[0]).any():
-            raise ValueError("Polygon does not overlap DEM.")
-        inmask = rasterize_mask(gdf, src, ALL_TOUCHED)
-        if inmask.sum()==0: raise ValueError("Mask rasterized to 0 pixels.")
+    if np.isscalar(tol_m):
+        tol_np = np.full((H,W), float(abs(tol_m)), dtype="float64")
+    else:
+        tol_np = np.abs(np.asarray(tol_m, dtype="float64"))
+        if tol_np.shape != (H,W): raise ValueError("tol array shape mismatch")
 
-        # Geometry for auto C
-        poly_union = sops.unary_union(gdf.geometry)
-        A = float(poly_union.area)
-        Lrh, _ = _poly_dims(poly_union)
+    mode8 = (neighbours == 8)
+    is_failure = (str(mode).lower() == "failure")
 
-        # Choose C (tol)
-        if job.method == "manual":
-            tol = float(job.tol_in)
-        elif job.method == "e_Lrh":
-            tol = _auto_C_from_e_Lrh(float(job.e_ratio), Lrh, dx)
-        elif job.method == "area_shape":
-            tol = _auto_C_from_area_shape(float(job.e_ratio), A, float(job.shape_k), dx)
+    # GPU path
+    if use_gpu and HAVE_CUPY:
+        dem_g  = cp.asarray(dem_np)
+        base_g = dem_g.copy()
+        tol_g  = cp.asarray(tol_np)
+        valid_g= cp.asarray(valid_np)
+        work_g = cp.asarray(work_mask)
+        fix_g  = cp.asarray(fixed_mask) if fixed_mask is not None else cp.zeros_like(work_g, dtype=cp.bool_)
+        floor_md_g = (dem_g - float(max_depth)) if (max_depth is not None) else None
+        zfloor = float(z_floor) if (z_floor is not None and np.isfinite(z_floor)) else None
+
+        prev_vol = None
+        for itr in range(int(max_iters)):
+            mean_nb = neighbour_mean(base_g, valid_g, mode8=mode8, use_gpu=True)
+            target  = mean_nb - tol_g if is_failure else mean_nb + tol_g
+            if is_failure:
+                candidate = cp.where(work_g & (~fix_g) & (~cp.isnan(target)), target, base_g)
+                if floor_md_g is not None:
+                    candidate = cp.maximum(candidate, floor_md_g)
+                if zfloor is not None:
+                    candidate = cp.maximum(candidate, zfloor)
+                new_base = cp.where(candidate < base_g, candidate, base_g)
+            else:
+                candidate = cp.where(work_g & (~fix_g) & (~cp.isnan(target)), target, base_g)
+                new_base = cp.where(candidate > base_g, candidate, base_g)
+
+            diff = cp.abs(new_base[work_g] - base_g[work_g])
+            delta = float(cp.nanmax(diff).get()) if diff.size else 0.0
+            base_g = new_base
+
+            if stop_vol_eps is not None:
+                if is_failure:
+                    thickness_g = cp.where(work_g, cp.maximum(dem_g - base_g, 0.0), 0.0)
+                else:
+                    thickness_g = cp.where(work_g, cp.maximum(base_g - dem_g, 0.0), 0.0)
+                vol = float(cp.nansum(thickness_g).get()) * float(pixel_area)
+                if prev_vol is not None and abs(vol - prev_vol) < float(stop_vol_eps):
+                    print(f"[ITR-GPU] converged (volΔ<{stop_vol_eps}) at iter={itr}")
+                    break
+                prev_vol = vol
+
+            if itr < 5 or itr % 25 == 0:
+                print(f"[ITR-GPU] iter={itr:4d} delta={delta:.6f}")
+            if delta < stop_eps:
+                print(f"[ITR-GPU] converged at iter={itr} (delta<{stop_eps})")
+                break
+
+        if is_failure:
+            thickness_g = dem_g - base_g
         else:
-            raise ValueError(f"Unknown C_FROM method {job.method}")
-        if not np.isfinite(tol) or tol <= 0:
-            raise ValueError("Computed tolerance (C) is invalid. Check geometry and parameters.")
+            thickness_g = base_g - dem_g
+        thickness_g = cp.where(work_g, cp.maximum(thickness_g, 0.0), 0.0)
 
-        base, thick, niter = slbl_iterative_exact(
-            dem_ma, inmask, tol_scalar=tol,
-            criteria=CRITERIA, neighbours=NEIGHBOURS, mode=MODE,
-            stop_eps=STOP_EPS, max_volume=MAX_VOLUME, pixel_area=pix_area,
-            max_depth=job.max_depth, not_deepen=NOT_DEEPEN,
-            use_gpu=HAVE_CUPY
+        base = cp.asnumpy(base_g)
+        thick = cp.asnumpy(thickness_g)
+        return base, thick
+
+    # CPU path
+    base = dem_np.copy()
+    fix = fixed_mask if fixed_mask is not None else np.zeros_like(work_mask, dtype=bool)
+    prev_vol = None
+    for itr in range(int(max_iters)):
+        mean_nb = _neigh_mean_cpu(base, valid_np, mode8=mode8)
+        target    = mean_nb - tol_np if is_failure else mean_nb + tol_np
+
+        if is_failure:
+            candidate = np.where(work_mask & (~fix) & (~np.isnan(target)), target, base)
+            if max_depth is not None:
+                candidate = np.maximum(candidate, dem_np - float(max_depth))
+            if z_floor is not None and np.isfinite(z_floor):
+                candidate = np.maximum(candidate, float(z_floor))
+            new_base = np.where(candidate < base, candidate, base)
+        else:
+            candidate = np.where(work_mask & (~fix) & (~np.isnan(target)), target, base)
+            new_base = np.where(candidate > base, candidate, base)
+
+        diff  = np.abs(new_base[work_mask] - base[work_mask])
+        delta = 0.0 if diff.size == 0 or np.all(np.isnan(diff)) else float(np.nanmax(diff))
+        base[:] = new_base
+
+        if stop_vol_eps is not None:
+            if is_failure:
+                thickness = np.where(work_mask, np.maximum(dem_np - base, 0.0), 0.0)
+            else:
+                thickness = np.where(work_mask, np.maximum(base - dem_np, 0.0), 0.0)
+            vol = float(np.nansum(thickness) * float(pixel_area))
+            if prev_vol is not None and abs(vol - prev_vol) < float(stop_vol_eps):
+                print(f"[ITR] converged (volΔ<{stop_vol_eps}) at iter={itr}")
+                break
+            prev_vol = vol
+
+        if itr < 5 or itr % 25 == 0:
+            print(f"[ITR] iter={itr:4d} delta={delta:.6f}")
+        if delta < stop_eps:
+            print(f"[ITR] converged at iter={itr} (delta<{stop_eps})")
+            break
+
+    if is_failure:
+        thickness = dem_np - base
+    else:
+        thickness = base - dem_np
+    thickness = np.where(work_mask, np.maximum(thickness, 0.0), 0.0)
+    return base, thickness
+
+# ---------------------------
+# Per-job execution
+# ---------------------------
+def format_tol_label(tol_m):
+    t = float(abs(tol_m)) if np.isscalar(tol_m) else float(np.nanmax(tol_m))
+    return f"tol{t:.4f}m"
+
+def format_md_label(max_depth):
+    return f"md{int(max_depth)}m" if max_depth is not None else "nolimit"
+
+def format_fk_label(K):
+    if isinstance(K,(list,tuple)) and len(K)==2:
+        return f"fk{int(K[0])}to{int(K[1])}pxg"
+    return f"fk{int(K)}px" if (K is not None and K>0) else "fk0"
+
+def format_e_label(e):
+    if e == "" or e is None:
+        return "eNA"
+    s = f"{float(e):.3e}"        # e.g., '5.000e-05'
+    return "e" + s.replace("+", "p").replace("-", "m")  # 'e5.000e m05'
+
+def _label_cfrom(method, tol_used, e_ratio, shape_k):
+    if method == "manual":
+        return f"{format_tol_label(tol_used)}"
+    elif method == "e_Lrh":
+        return f"{format_e_label(e_ratio)}"
+    elif method == "area_shape":
+        return f"{format_e_label(e_ratio)}_k{float(shape_k):.3f}"
+    return method
+
+def run_one_job(job):
+    # job: (shp_path, method, tol_m_in, e_ratio, shape_k, max_depth, K)
+    shp_path, method, tol_m_in, e_ratio, shape_k, max_depth, K = job
+    name = os.path.splitext(os.path.basename(shp_path))[0]
+    try:
+        src, dem, prof, pixel_area, dem_bounds, dem_epsg = read_dem(DEM_PATH)
+        dx = abs(src.transform.a)
+        pixel_size = dx
+
+        gdf = load_and_prepare_gdf(shp_path, target_epsg=dem_epsg, pixel_size=pixel_size, buffer_pixels=BUFFER_PIXELS)
+        if not gdf.intersects(gpd.GeoSeries([dem_bounds], crs=f"EPSG:{dem_epsg}").iloc[0]).any():
+            raise ValueError("Polygon does not overlap DEM extent")
+        inmask = vector_to_mask(gdf, src, all_touched=ALL_TOUCHED, burn_value=1)
+        if inmask.sum() == 0: raise ValueError("Rasterized mask has 0 cells")
+
+        dem_valid = ~np.ma.getmaskarray(dem)
+        work_mask = inmask & dem_valid
+        if work_mask.sum() == 0: raise ValueError("Mask overlaps 0 valid DEM cells")
+
+        # Geom measures
+        poly_union = unary_union(gdf.geometry)
+        area_A = float(poly_union.area)
+        Lrh, width_w = _poly_dims(poly_union)
+
+        # Tolerance selection (tol_used must be scalar here; feathering may spatialize it later)
+        if method == "manual":
+            tol_used = float(tol_m_in)
+        elif method == "e_Lrh":
+            tol_used = _auto_C_from_e_Lrh(float(e_ratio), Lrh, dx)
+            if not np.isfinite(tol_used):
+                raise ValueError("Auto C (e_Lrh) failed; check E_RATIO/Lrh/DEM pixel size.")
+        elif method == "area_shape":
+            tol_used = _auto_C_from_area_shape(float(e_ratio), area_A, float(shape_k), dx)
+            if not np.isfinite(tol_used):
+                raise ValueError("Auto C (area_shape) failed; check E_RATIO/area/DEM pixel size.")
+        else:
+            raise ValueError(f"Unknown C_FROM method '{method}'")
+
+        # Feathering / gradation
+        on_gpu = USE_GPU and HAVE_CUPY
+        is_grad = isinstance(K,(list,tuple)) and len(K)==2 and (K[0] is not None) and (K[1] is not None)
+        if is_grad and (K[0] < K[1]):
+            upper_mask, lower_mask, gd = build_upper_lower_masks(dem, inmask, method=GRADATION_SPLIT_METHOD, elev_q=GRADATION_ELEV_Q)
+            tol_eff = compute_feathered_tol_gradated(inmask, tol_used, float(K[0]), float(K[1]),
+                                                     upper_mask, lower_mask, use_gpu=on_gpu)
+            grad_meta = {"mode":gd.get("mode","elev"), **gd, "K_upper":float(K[0]), "K_lower":float(K[1])}
+        else:
+            if is_grad and K[0] >= K[1]:
+                print(f"[WARN] Gradation expects K_upper < K_lower; got {K}. Using constant K={K[1]}")
+                K = K[1]
+            tol_eff = compute_feathered_tol(inmask, tol_used, (K if not isinstance(K,(list,tuple)) else K), use_gpu=on_gpu)
+            grad_meta = {"mode":"constant"}
+
+        label_core = _label_cfrom(method, tol_used, e_ratio, shape_k)
+        label = f"{label_core}_{format_md_label(max_depth)}_{format_fk_label(K)}_{SLBL_MODE}"
+        print(f"\n[SCN] >>> {name} | {label} | C_FROM={method} | tol_used={tol_used:.6f} m | Lrh={Lrh:.2f} m, w={width_w:.2f} m, A={area_A:.2f} m²")
+
+        fixed_mask = None
+        if FIXED_PATH:
+            f_gdf = load_and_prepare_gdf(FIXED_PATH, target_epsg=dem_epsg)
+            fixed_mask = vector_to_mask(f_gdf, src, all_touched=ALL_TOUCHED, burn_value=1)
+
+        z_floor = compute_z_floor(inmask, dem, use_gpu=(USE_GPU and HAVE_CUPY)) if USE_Z_FLOOR else None
+
+        base, thick = slbl_iterative(
+            dem=dem, inmask=inmask, tol_m=tol_eff, stop_eps=STOP_EPS, max_iters=MAX_ITERS,
+            neighbours=NEIGHBOURS, max_depth=max_depth, fixed_mask=fixed_mask, z_floor=z_floor,
+            use_gpu=on_gpu, mode=SLBL_MODE, stop_vol_eps=STOP_VOL_EPS, pixel_area=pixel_area
         )
 
-        # v3-style label
-        K = 0  # Feathering/gradation K; keep 0 if not used
-        label_core = format_tol_label(tol)
-        label = f"{label_core}_{format_md_label(job.max_depth)}_{format_fk_label(K)}_{MODE}"
+        if DEBUG_WRITE_TOL_RASTER:
+            try:
+                tol_arr_out = tol_eff if not np.isscalar(tol_eff) else np.full(dem.shape, float(tol_eff), dtype='float32')
+                save_gtiff(os.path.join(OUT_DIR, f"{name}_{label}_tol_target.tif"), tol_arr_out, prof, nodata=np.nan)
+            except Exception as _e:
+                print("[DBG] tol raster failed:", _e)
 
-        # Outputs
-        out_dir = os.path.join(OUT_DIR, name)
-        os.makedirs(out_dir, exist_ok=True)
+        if DEBUG_REPORT_CLAMP and SLBL_MODE=="failure":
+            denom = float(work_mask.sum()) if work_mask.sum() else 1.0
+            zclamp = 0.0; mdclamp = 0.0
+            if USE_Z_FLOOR and z_floor is not None and np.isfinite(z_floor):
+                zclamp = 100.0 * float(np.count_nonzero(work_mask & (base <= (z_floor + 1e-6)))) / denom
+            if max_depth is not None:
+                floor_md = dem.filled(np.nan) - float(max_depth)
+                mdclamp = 100.0 * float(np.count_nonzero(work_mask & (base <= (floor_md + 1e-6)))) / denom
+            print(f"[CLAMP] z_floor%={zclamp:.1f} | max_depth%={mdclamp:.1f}")
+
+        pos = (thick > 0)
+        max_depth_m  = float(np.nanmax(thick)) if np.isfinite(thick).any() else 0.0
+        mean_depth_m = float(np.nanmean(thick[pos])) if np.any(pos) else 0.0
+        volume_m3    = float(np.nansum(thick) * pixel_area) if np.isfinite(thick).any() else 0.0
+
+        if np.any(pos):
+            dvals = thick[pos].astype("float64")
+            p10_d, p50_d, p90_d = np.nanpercentile(dvals, [10, 50, 90])
+        else:
+            p10_d = p50_d = p90_d = 0.0
+
+        footprint_px   = int(work_mask.sum())
+        mask_area_m2   = float(footprint_px * pixel_area)
+        poly_area_m2   = float(gdf.area.sum())
+
+        dem_vals = dem.filled(np.nan)[work_mask]
+        dem_min  = float(np.nanmin(dem_vals)) if dem_vals.size else np.nan
+        dem_max  = float(np.nanmax(dem_vals)) if dem_vals.size else np.nan
+        dem_mean = float(np.nanmean(dem_vals)) if dem_vals.size else np.nan
+        dem_rel  = float(dem_max - dem_min) if np.isfinite(dem_max) and np.isfinite(dem_min) else np.nan
+
+        base_path = thick_path = ""
         if WRITE_RASTERS:
-            save_gtiff(os.path.join(out_dir, f"{name}_{label}_slbl.tif"), base, prof, nodata=np.nan)
-            save_gtiff(os.path.join(out_dir, f"{name}_{label}_thick.tif"), thick, prof, nodata=np.nan)
+            base_suffix  = "slbl_base.tif"  if SLBL_MODE=="failure" else "slbl_fill_base.tif"
+            thick_suffix = "slbl_thickness.tif" if SLBL_MODE=="failure" else "slbl_fill_height.tif"
+            base_path  = os.path.join(OUT_DIR, f"{name}_{label}_{base_suffix}")
+            thick_path = os.path.join(OUT_DIR, f"{name}_{label}_{thick_suffix}")
+            save_gtiff(base_path,  base,  prof, nodata=np.nan)
+            save_gtiff(thick_path, thick, prof, nodata=0.0)
 
-        # ---- Cross-sections (v3-compatible) ----
+        # Cross-sections
         wrote_x_count = 0
         if WRITE_XSECTIONS and XSECT_LINES_SOURCE:
             try:
-                def _load_lines(src_path, epsg):
-                    if os.path.isdir(src_path):
-                        from glob import glob
-                        files = [p for p in glob(os.path.join(src_path, "*.shp"))]
-                        gdfs = [gpd.read_file(p) for p in files if os.path.isfile(p)]
-                        if not gdfs:
-                            return gpd.GeoDataFrame(geometry=[]), 0
-                        gdfL = pd.concat(gdfs, ignore_index=True)
-                    else:
-                        gdfL = gpd.read_file(src_path)
-                    if gdfL.crs is None or gdfL.crs.to_epsg() != epsg:
-                        gdfL = gdfL.to_crs(epsg=epsg)
-                    if "geometry" not in gdfL.columns:
-                        gdfL = gpd.GeoDataFrame(gdfL, geometry=gdfL.geometry)
-                    return gdfL, len(gdfL)
-
-                lines_gdf, _ = _load_lines(XSECT_LINES_SOURCE, src.crs.to_epsg())
-                if lines_gdf is None or lines_gdf.empty:
-                    print("[XSECT] No lines found.")
-                else:
-                    XSECT_CLIP_TO_POLY = True
-                    poly_union_cs = poly_union if XSECT_CLIP_TO_POLY else None
-
-                    xs_dir = os.path.join(OUT_DIR, XSECT_DIRNAME, name)
-                    os.makedirs(xs_dir, exist_ok=True)
-
-                    dem_arr  = dem_ma.filled(np.nan)
-                    base_arr = base
-                    thick_arr= thick
-                    work_mask= inmask
-
-                    step_eff = float(XSECT_STEP_M) if (XSECT_STEP_M and XSECT_STEP_M>0) else float(abs(src.transform.a))
-
-                    for i in range(len(lines_gdf)):
-                        row = lines_gdf.iloc[i]
-                        geom = row.geometry
-                        if geom is None or geom.is_empty:
-                            continue
+                lines_gdf, _nfiles = load_lines_many(XSECT_LINES_SOURCE, dem_epsg)
+                if lines_gdf is not None and not lines_gdf.empty:
+                    poly_union_cs = unary_union(gdf.geometry) if XSECT_CLIP_TO_POLY else None
+                    xs_dir = os.path.join(OUT_DIR, XSECT_DIRNAME, name); os.makedirs(xs_dir, exist_ok=True)
+                    step_eff = float(XSECT_STEP_M) if (XSECT_STEP_M and XSECT_STEP_M>0) else float(pixel_size)
+                    for _, row in lines_gdf.iterrows():
+                        lid = _infer_line_id(row); geom=row.geometry
                         if XSECT_CLIP_TO_POLY and poly_union_cs is not None:
-                            try:
-                                geom = geom.intersection(poly_union_cs)
-                                if geom.is_empty:
-                                    continue
-                            except Exception:
-                                pass
-
-                        parts = _line_parts(geom)
-                        if not parts:
-                            continue
-
-                        lid = _infer_line_id(row, idx=i)
-                        for li, part in enumerate(parts):
+                            geom = geom.intersection(poly_union_cs)
+                            if geom.is_empty: continue
+                        for li, part in enumerate(_line_parts(geom)):
                             pts = _densify_line(part, step_eff)
-                            samples = _sample_arrays(pts, src.transform, dem_arr, base_arr, thick_arr,
+                            samples = _sample_arrays(pts, src.transform, dem.filled(np.nan), base, thick,
                                                      inmask=(work_mask if XSECT_CLIP_TO_POLY else None))
-                            if not samples:
-                                continue
+                            if not samples: continue
                             dfp = pd.DataFrame(samples, columns=["Distance_m","X","Y","DEM_z","Base_z","Thickness_m"])
-                            dfp.insert(0,"LinePart",li)
-                            dfp.insert(0,"LineID",_sanitize(lid))
-                            dfp.insert(0,"Scenario",name)
-                            dfp.insert(0,"Label",label)
-
+                            dfp.insert(0,"LinePart",li); dfp.insert(0,"LineID",lid); dfp.insert(0,"Scenario",name); dfp.insert(0,"Label",label)
                             fn = f"{name}_{label}_xsect_{_sanitize(lid)}_p{li}.csv"
                             dfp.to_csv(os.path.join(xs_dir, fn), index=False)
                             wrote_x_count += 1
-
-                    print(f"[XSECT] wrote {wrote_x_count} CSV(s) → {xs_dir}")
+                    print(f"[XSECT] wrote {wrote_x_count} CSV(s)")
             except Exception as xe:
                 print(f"[WARN] x-sections: {xe}")
 
-        # ---- Metrics & summary row (v3-ish schema) ----
-        abs_thick = np.abs(thick)
-        max_depth_m  = float(np.nanmax(abs_thick)) if np.isfinite(abs_thick).any() else 0.0
-        mask_pos     = (inmask & np.isfinite(abs_thick))
-        mean_depth_m = float(np.nanmean(abs_thick[mask_pos])) if np.any(mask_pos) else 0.0
-        volume_m3    = float(np.nansum(abs_thick) * pix_area)
+        print(f"[DONE] {name} | {label}: max={max_depth_m:.3f} m, mean={mean_depth_m:.3f} m, vol={volume_m3:.1f} m³ | A={mask_area_m2:.1f} m² | xsects={wrote_x_count}")
 
-        row_out = {
+        return {
             "Scenario": name, "DEM": os.path.basename(DEM_PATH), "Label": label,
-            "Mode": MODE,
-            "C_From": job.method, "Tol_m": round(float(tol), 6),
-            "E_Ratio": ("" if job.method=="manual" else float(job.e_ratio)),
-            "Shape_k": (float(job.shape_k) if job.method=="area_shape" else ""),
-            "Lrh_m": float(Lrh) if np.isfinite(Lrh) else "",
-            "Width_w_m": "",  # optional; not used by viewer logic
-            "PolyArea_m2": float(A),
+            "Mode": SLBL_MODE,
+            "C_From": method, "Tol_m": round(float(tol_used), 6),
+            "E_Ratio": ("" if method=="manual" else float(e_ratio)),
+            "Shape_k": (float(shape_k) if method=="area_shape" else ""),
+            "Lrh_m": round(Lrh,3) if np.isfinite(Lrh) else "",
+            "Width_w_m": round(width_w,3) if np.isfinite(width_w) else "",
+            "PolyArea_m2": round(area_A,3),
             "Neighbours": NEIGHBOURS,
-            "Feather_K_px": np.nan, "Feather_Gradated": False,
-            "Feather_K_upper_px": "", "Feather_K_lower_px": "",
-            "Gradation_Mode": "constant", "Gradation_Zsplit": "", "Gradation_RowSplit": "",
-            "MaxDepthLimit_m": ("" if job.max_depth is None else float(job.max_depth)),
+            "Feather_K_px": (int(K) if (isinstance(K,(int,float)) and K is not None) else np.nan),
+            "Feather_Gradated": isinstance(K,(list,tuple)),
+            "Feather_K_upper_px": (int(K[0]) if isinstance(K,(list,tuple)) else ""),
+            "Feather_K_lower_px": (int(K[1]) if isinstance(K,(list,tuple)) else ""),
+            "Gradation_Mode": grad_meta.get("mode","constant"),
+            "Gradation_Zsplit": grad_meta.get("z_split",""),
+            "Gradation_RowSplit": grad_meta.get("row_split",""),
+            "MaxDepthLimit_m": ("" if max_depth is None else float(max_depth)),
             "MaxDepth_m": round(max_depth_m,3), "MeanDepth_m": round(mean_depth_m,3),
-            "Depth_P10_m": "", "Depth_P50_m": "", "Depth_P90_m": "",
+            "Depth_P10_m": round(float(p10_d),3), "Depth_P50_m": round(float(p50_d),3), "Depth_P90_m": round(float(p90_d),3),
             "Volume_m3": round(volume_m3,3),
-            "Footprint_px": int(inmask.sum()), "MaskArea_m2": float(inmask.sum())*pix_area,
+            "Footprint_px": int(footprint_px), "MaskArea_m2": round(mask_area_m2,3),
+            "DEM_Min_m": round(dem_min,3) if np.isfinite(dem_min) else "",
+            "DEM_Max_m": round(dem_max,3) if np.isfinite(dem_max) else "",
+            "DEM_Mean_m": round(dem_mean,3) if np.isfinite(dem_mean) else "",
+            "DEM_Relief_m": round(dem_rel,3) if np.isfinite(dem_rel) else "",
             "WroteRasters": bool(WRITE_RASTERS), "XSection_CSVs": int(wrote_x_count),
+            "BaseRaster": base_path, "ThicknessRaster": thick_path
         }
-        return row_out
 
     except Exception as e:
-        print(f"[ERROR] {name}: {type(e).__name__}: {e}")
-        return dict(Scenario=name, error=f"{type(e).__name__}: {e}")
+        label = "error"
+        tb = traceback.format_exc()
+        print(f"\n[ERROR] {name} | {label}\n{tb}\n", file=sys.stderr, flush=True)
+        return {
+            "Scenario": name, "Label": label, "Mode": SLBL_MODE,
+            "C_From": method, "Tol_m": float(tol_m_in) if np.isscalar(tol_m_in) else float('nan'),
+            "E_Ratio": ("" if method=="manual" else float(e_ratio)),
+            "Shape_k": (float(shape_k) if method=="area_shape" else ""),
+            "Feather_K_px": int(K) if isinstance(K,(int,float)) else np.nan,
+            "Feather_Gradated": isinstance(K,(list,tuple)),
+            "Feather_K_upper_px": (int(K[0]) if isinstance(K,(list,tuple)) else ""),
+            "Feather_K_lower_px": (int(K[1]) if isinstance(K,(list,tuple)) else ""),
+            "MaxDepthLimit_m": ("" if max_depth is None else float(max_depth)),
+            "Error": f"{type(e).__name__}: {e}", "Traceback": tb,
+            "WroteRasters": False, "XSection_CSVs": 0,
+            "BaseRaster": "", "ThicknessRaster": ""
+        }
 
 # ---------------------------
-# Batch orchestration
+# Scenario-level stats writer
 # ---------------------------
-def build_jobs():
-    shp_paths = [os.path.join(SCENARIO_DIR,f) for f in os.listdir(SCENARIO_DIR)
-                 if f.lower().endswith(".shp")]
-    if not shp_paths:
-        raise RuntimeError(f"No shapefiles in {SCENARIO_DIR}")
+def _write_scenario_stats(df_all: pd.DataFrame, out_path: str):
+    if df_all.empty or "Volume_m3" not in df_all.columns: return
+    def q10(s): return s.quantile(0.10, interpolation="linear")
+    def q50(s): return s.quantile(0.50, interpolation="linear")
+    def q90(s): return s.quantile(0.90, interpolation="linear")
+    by_scn = df_all.groupby(["Scenario","Mode","C_From","E_Ratio","Shape_k"]).agg(
+        N_runs=("Volume_m3","size"),
+        Volume_m3_min=("Volume_m3","min"), Volume_m3_mean=("Volume_m3","mean"),
+        Volume_m3_p10=("Volume_m3",q10),   Volume_m3_p50=("Volume_m3",q50),
+        Volume_m3_p90=("Volume_m3",q90),   Volume_m3_max=("Volume_m3","max"),
+        MaxDepth_m_min=("MaxDepth_m","min"), MaxDepth_m_mean=("MaxDepth_m","mean"),
+        MaxDepth_m_p10=("MaxDepth_m",q10),   MaxDepth_m_p50=("MaxDepth_m",q50),
+        MaxDepth_m_p90=("MaxDepth_m",q90),   MaxDepth_m_max=("MaxDepth_m","max"),
+    ).reset_index()
+    by_scn.to_csv(out_path, index=False)
+    print(f"✅ Scenario stats written: {out_path}")
 
-    methods = C_FROM if isinstance(C_FROM,(list,tuple)) else [C_FROM]
-    e_vals  = E_RATIOS if isinstance(E_RATIOS,(list,tuple)) else [E_RATIO]
-    k_vals  = SHAPE_KS if isinstance(SHAPE_KS,(list,tuple)) else [SHAPE_K]
-    tol_vals= TOLERANCES if isinstance(TOLERANCES,(list,tuple)) else [TOLERANCES]
-    md_vals = MAX_DEPTHS if isinstance(MAX_DEPTHS,(list,tuple)) else [MAX_DEPTHS]
+# ---------------------------
+# Job builder
+# ---------------------------
+def _as_list(x, fallback=None):
+    if isinstance(x, (list, tuple)): 
+        return [v for v in x]
+    return [x if x is not None else fallback]
 
-    jobs=[]
-    for shp in shp_paths:
-        for md in md_vals:
-            for m in methods:
-                if m == "manual":
-                    for t in tol_vals:
-                        jobs.append(Job(shp, m, float(t), float(e_vals[0]), float(k_vals[0]), md))
-                elif m == "e_Lrh":
-                    for e in e_vals:
-                        jobs.append(Job(shp, m, float("nan"), float(e), float(k_vals[0]), md))
-                elif m == "area_shape":
-                    for e,k in product(e_vals, k_vals):
-                        jobs.append(Job(shp, m, float("nan"), float(e), float(k), md))
-                else:
-                    raise ValueError(f"Unknown method {m}")
+def _get_cfrom_list():
+    cf = C_FROM
+    if isinstance(cf, (list, tuple)): 
+        return [str(v) for v in cf]
+    return [str(cf)]
+
+def _get_feather_Ks_list():
+    Ks = FEATHER_TOL_K
+    return list(Ks) if isinstance(Ks,(list,tuple)) else [Ks]
+
+def _get_gradation_pairs(base_Ks):
+    if not GRADATION_ENABLE: return []
+    if GRADATION_K_PAIRS:
+        return [(int(a),int(b)) for (a,b) in GRADATION_K_PAIRS if a is not None and b is not None and a<b]
+    base_Ks = sorted(int(k) for k in base_Ks if k is not None)
+    out=[]
+    for i, ku in enumerate(base_Ks):
+        for kl in base_Ks[i+1:]: out.append((ku, kl))  # ku < kl
+    return out
+
+def _build_jobs(shp_list):
+    """Return list of jobs: (shp, method, tol_in, e_ratio, shape_k, max_depth, K)"""
+    cf_list = _get_cfrom_list()
+    Ks      = _get_feather_Ks_list()
+    K_pairs = _get_gradation_pairs(Ks)
+
+    # Build lists (ensure lists exist)
+    e_list = _as_list(E_RATIOS, fallback=E_RATIO)
+    k_list = _as_list(SHAPE_KS, fallback=SHAPE_K)
+    tol_list = _as_list(TOLERANCES, fallback=None)
+
+    jobs = []
+
+    for shp in shp_list:
+        for md in MAX_DEPTHS:
+            # constant feather K
+            for K in Ks:
+                for method in cf_list:
+                    method = method.strip()
+                    if method == "manual":
+                        for tol in tol_list:
+                            jobs.append((shp, "manual", float(tol), "", "", md, K))
+                    elif method == "e_Lrh":
+                        for e in e_list:
+                            jobs.append((shp, "e_Lrh", 0.0, float(e), "", md, K))
+                    elif method == "area_shape":
+                        for e, k in product(e_list, k_list):
+                            jobs.append((shp, "area_shape", 0.0, float(e), float(k), md, K))
+                    else:
+                        raise ValueError(f"Unknown C_FROM method '{method}'")
+
+            # gradated K pairs
+            for pair in K_pairs:
+                for method in cf_list:
+                    method = method.strip()
+                    if method == "manual":
+                        for tol in tol_list:
+                            jobs.append((shp, "manual", float(tol), "", "", md, pair))
+                    elif method == "e_Lrh":
+                        for e in e_list:
+                            jobs.append((shp, "e_Lrh", 0.0, float(e), "", md, pair))
+                    elif method == "area_shape":
+                        for e, k in product(e_list, k_list):
+                            jobs.append((shp, "area_shape", 0.0, float(e), float(k), md, pair))
+                    else:
+                        raise ValueError(f"Unknown C_FROM method '{method}'")
     return jobs
 
+# ---------------------------
+# Driver
+# ---------------------------
 def main():
-    os.makedirs(OUT_DIR, exist_ok=True)
-    jobs = build_jobs()
-    print(f"[INFO] Jobs: {len(jobs)}   (MP={N_PROCESSES}, GPU={'on' if HAVE_CUPY else 'off'})")
+    shp_list = [os.path.join(SCENARIO_DIR, f) for f in os.listdir(SCENARIO_DIR) if f.lower().endswith(".shp")]
+    if not shp_list:
+        print(f"No shapefiles found in {SCENARIO_DIR}")
+        return
 
-    if N_PROCESSES > 1:
-        with Pool(processes=N_PROCESSES) as pool:
-            rows = pool.map(run_one, jobs, chunksize=MP_CHUNKSIZE)
+    jobs = _build_jobs(shp_list)
+
+    # GPU ⇒ single process; CPU ⇒ cap
+    if USE_GPU and HAVE_CUPY:
+        procs = 1
     else:
-        rows = [run_one(j) for j in jobs]
+        procs = max(1, int(N_PROCESSES)) if N_PROCESSES else min(8, cpu_count())
+
+    print(f"Running {len(jobs)} jobs on {procs} process(es)...")
+    print(f"  Mode        : {SLBL_MODE}")
+    print(f"  C_FROM      : {_get_cfrom_list()}")
+    print(f"  E_RATIOS    : {_as_list(E_RATIOS, fallback=E_RATIO)}")
+    print(f"  SHAPE_KS    : {_as_list(SHAPE_KS, fallback=SHAPE_K)}")
+    print(f"  Tolerances  : {_as_list(TOLERANCES)}")
+    print(f"  MaxDepths   : {MAX_DEPTHS}")
+    print(f"  Feather K   : {_get_feather_Ks_list()}")
+    if GRADATION_ENABLE:
+        print(f"  Gradation   : pairs={_get_gradation_pairs(_get_feather_Ks_list())} (upper→lower), split={GRADATION_SPLIT_METHOD}@{GRADATION_ELEV_Q}")
+
+    if procs <= 1:
+        rows = [run_one_job(j) for j in jobs]
+    else:
+        with Pool(processes=procs, maxtasksperchild=1) as pool:
+            rows = list(pool.imap_unordered(run_one_job, jobs, chunksize=MP_CHUNKSIZE))
 
     df = pd.DataFrame(rows)
+    os.makedirs(os.path.dirname(CSV_SUMMARY), exist_ok=True)
     df.to_csv(CSV_SUMMARY, index=False)
-    print(f"[DONE] Wrote {CSV_SUMMARY}")
+    print(f"\n✅ Summary written: {CSV_SUMMARY}")
+
+    cols = [c for c in [
+        "Scenario","Mode","C_From","E_Ratio","Shape_k","Tol_m",
+        "Lrh_m","Width_w_m","PolyArea_m2",
+        "Label","MaxDepthLimit_m","MaxDepth_m","MeanDepth_m","Depth_P50_m","Volume_m3",
+        "MaskArea_m2","XSection_CSVs","Error"
+    ] if c in df.columns]
+    if cols: print(df[cols])
+
+    try:
+        ok = df
+        if "Error" in ok.columns:
+            ok = ok[ok["Error"].astype(str).str.len().fillna(0) == 0]
+        ok = ok.dropna(subset=["Scenario","Volume_m3"]).copy()
+        if not ok.empty:
+            _write_scenario_stats(ok, CSV_SCENARIO_STATS)
+    except Exception as e:
+        print("[WARN] scenario stats failed:", e)
 
 if __name__ == "__main__":
     main()
