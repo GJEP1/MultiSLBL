@@ -1,9 +1,12 @@
 # MultiSLBL
 
-Batch processing of SLBL thickness for one or more scenarios with optional GPU acceleration.
+Batch processing potential landslide glide planes using SLBL methods, for one or more scenarios.
+Optional GPU acceleration improves processing time drastically.
 The engine auto-detects an NVIDIA GPU via CuPy and falls back to fast NumPy on CPU if a GPU isn’t available.
 
-The SLBL Scenario Viewer (Streamlit) lets you explore results: map + cross-lines, oriented cross-sections, and per-scenario P10/P50/P90 tables.
+The SLBL Scenario Viewer (Streamlit) lets you explore results: map + cross-lines, oriented cross-sections, thickness maps and per-scenario P10/P50/P90 tables.
+
+The script also optionally outputs ASCII thickness rasters for use in AvaFrame modelling.
 
 ## Quick start
 Create a clean conda env (Windows/Linux)
