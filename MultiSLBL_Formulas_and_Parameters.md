@@ -220,33 +220,35 @@ Where:
 
 ## Typical Parameter Combinations
 
-### **Conservative Run (Slow, Precise)**
-```python
-TOLERANCES = [0.001, 0.002]
-E_RATIOS = [0.0001, 0.0002]
-MAX_ITERS = 10000
-STOP_EPS = 1e-4
-FEATHER_TOL_K = [100, 150]
-```
-
 ### **Aggressive Run (Fast, Exploratory)**
 ```python
-TOLERANCES = [0.01, 0.02]
-E_RATIOS = [0.001, 0.002]
+TOLERANCES = [0.001,0.02]
+E_RATIOS = [1,5]
 MAX_ITERS = 2000
-STOP_EPS = 1e-3
-FEATHER_TOL_K = [30, 50]
+STOP_EPS = 1e-4
+FEATHER_TOL_K = [0,150]
 ```
 
 ### **Parameter Sweep (Comprehensive)**
 ```python
 C_FROM = ["manual", "e_Lrh", "area_shape"]
 TOLERANCES = [0.001, 0.002, 0.005, 0.01]
-E_RATIOS = [0.0001, 0.0005, 0.001, 0.005]
+E_RATIOS = [1,2,3,4,5]
 SHAPE_KS = [0.05, 0.1, 0.5, 1.0]
-FEATHER_TOL_K = [50, 100, 150]
+FEATHER_TOL_K = [0, 100, 200]
 MAX_DEPTHS = [None, 5.0, 10.0, 20.0]
+MAX_ITERS = 2000
 ```
+
+### **Conservative Run (Slow, Precise)**
+```python
+TOLERANCES = [0.001,0.002]
+E_RATIOS = [2,3,4]
+MAX_ITERS = 5000
+STOP_EPS = 1e-7
+FEATHER_TOL_K = [100,150]
+```
+
 *Warning: Cartesian product creates many scenarios!*
 
 ---
